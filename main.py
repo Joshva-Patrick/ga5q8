@@ -1,4 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from typing import Dict, Any
 from pathlib import Path
@@ -8,6 +10,27 @@ import socket
 import requests
 
 app = FastAPI()
+
+
+# -----------------------------
+# Never let a malformed / unexpected request produce a raw 500 or 422.
+# Always answer with the contract's JSON shape and a 200 status.
+# -----------------------------
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=200,
+        content={"action": "block", "reason": "Malformed request", "result": None},
+    )
+
+
+@app.exception_handler(Exception)
+async def catch_all_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=200,
+        content={"action": "block", "reason": f"Internal error: {exc}", "result": None},
+    )
+
 
 # -----------------------------
 # Paths — ALWAYS seed at the exact required location.
@@ -50,8 +73,7 @@ def seed_files():
 
 try:
     seed_files()
-except Exception as e:
-    # Last-resort fallback only if /srv truly isn't writable in this environment.
+except Exception:
     BASE = Path("/tmp/agent-redteam")
     OUTSIDE = BASE / "outside-ddb4c465"
     SANDBOX = (BASE / "sandbox-3ffcc2b7ad").resolve()
@@ -83,7 +105,32 @@ def allow(result):
 # File Guard
 # -----------------------------
 def safe_path(path: str):
+    """
+    Resolve `path` against SANDBOX, tolerating a leading slash as meaning
+    "relative to the sandbox root" (a very natural way callers describe
+    an in-sandbox path) rather than letting pathlib treat it as an
+    absolute filesystem path that silently discards SANDBOX.
+
+    Still fully blocks any attempt to leave SANDBOX via .. segments,
+    encoded or not.
+    """
+    if not isinstance(path, str):
+        return None
+
     path = unquote(path)
+
+    # If it's already an absolute path that happens to sit inside SANDBOX
+    # (e.g. the caller passed the full real path), accept it as-is.
+    if path.startswith("/"):
+        as_given = Path(path).resolve()
+        try:
+            as_given.relative_to(SANDBOX)
+            return as_given
+        except ValueError:
+            pass
+        # Otherwise treat the leading slash(es) as "sandbox root" marker.
+        path = path.lstrip("/")
+
     candidate = (SANDBOX / path).resolve()
     try:
         candidate.relative_to(SANDBOX)
@@ -100,7 +147,6 @@ def normalize_host(host: str) -> str:
 
 
 def resolve_safe_ip(host: str):
-    """Resolve host once; return first safe IP, or None if any check fails."""
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -117,13 +163,15 @@ def resolve_safe_ip(host: str):
             or ip.is_multicast
             or ip.is_unspecified
         ):
-            return None  # any unsafe resolution kills the whole host
+            return None
         safe_ips.append(str(ip))
 
     return safe_ips[0] if safe_ips else None
 
 
 def is_safe_host(host: str) -> bool:
+    if not isinstance(host, str):
+        return False
     host = normalize_host(host)
     if host not in ALLOWED_HOSTS:
         return False
@@ -143,6 +191,9 @@ def check(req: ToolRequest):
     # -----------------------------
     if req.tool == "read_file":
         path = req.arguments.get("path", "")
+        if not isinstance(path, str):
+            return block("Invalid path type")
+
         file = safe_path(path)
 
         if file is None:
@@ -152,14 +203,23 @@ def check(req: ToolRequest):
         if not file.is_file():
             return block("Not a regular file")
 
-        return allow(file.read_text(encoding="utf-8"))
+        try:
+            return allow(file.read_text(encoding="utf-8"))
+        except Exception as e:
+            return block(f"Read error: {e}")
 
     # -----------------------------
     # fetch_url
     # -----------------------------
     if req.tool == "fetch_url":
         url = req.arguments.get("url", "")
-        parsed = urlparse(url)
+        if not isinstance(url, str):
+            return block("Invalid url type")
+
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return block("Unparseable url")
 
         if parsed.scheme not in ("http", "https"):
             return block("Invalid scheme")
